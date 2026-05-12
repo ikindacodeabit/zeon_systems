@@ -49,12 +49,13 @@ python -m src.evaluate --pred outputs/hybrid_preds.csv --gt data/annotations.csv
 
 ## Results
 
-_(filled in after training)_
-
 | System | Precision | Recall | F1 | Mean angle err (°) | Median angle err (°) | Within 10° | Within 30° |
 |---|---|---|---|---|---|---|---|
-| Classical | — | — | — | — | — | — | — |
-| Two-stage hybrid | — | — | — | — | — | — | — |
+| Classical baseline | 0.393 | 0.445 | 0.417 | 107.8 | 107.9 | 9.7% | 14.5% |
+| Two-stage (oracle + angle, 5-fold CV) | 1.000* | 1.000* | 1.000* | 46.4 | 31.5 | 18.1% | 48.0% |
+| Two-stage (oracle + angle, single-fold 50 ep) | 1.000* | 1.000* | 1.000* | 38.0 | 22.0 | 21.4% | — |
+
+\* Oracle = GT centers as detector; isolates angle quality. End-to-end YOLO+angle metrics are produced by `notebooks/colab_train.ipynb`. See `report/report.md` for full analysis.
 
 ## Dataset
 
