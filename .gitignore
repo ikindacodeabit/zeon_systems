@@ -1,10 +1,10 @@
 Dataset/
-  outputs/
-  runs/
-  *.pt
-  *.pth
-  *.onnx
-  .venv/
-  __pycache__/
-  .DS_Store
-  .ipynb_checkpoints/
+outputs/
+runs/
+*.pt
+*.pth
+*.onnx
+.venv/
+__pycache__/
+.DS_Store
+.ipynb_checkpoints/
