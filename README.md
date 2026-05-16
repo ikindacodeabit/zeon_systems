@@ -1,274 +1,209 @@
 # zeon-tubes · Microcentrifuge Tube Detection & Orientation Estimation
 
-A two-stage computer vision system that detects microcentrifuge tube lids in overhead RGB images and estimates their full 360° orientation angle (joint-to-tab direction).
+A two-stage computer vision system that detects microcentrifuge tube lids in overhead RGB images and estimates their full 360° orientation angle (joint-to-tab direction), evaluated via 5-fold cross-validation on 70 images / 371 tubes.
 
 ---
 
 ## Results
 
+### Detection — YOLOv11n-OBB
+
 | Metric | Value |
 |---|---|
-| Detection Precision | **≥ 0.95** (5-fold CV, YOLOv11n-OBB) |
-| Detection Recall | **≥ 0.95** (5-fold CV) |
-| Detection F1 | **≥ 0.95** (5-fold CV) |
-| Angle MAE — isolated | **3.2° ± 0.8°** (GT crops, 5-fold CV) |
-| Angle Median — isolated | **2.1° ± 0.4°** |
-| Within 15° — isolated | **99.5% ± 0.6%** |
-| 180° flip rate | **0.3%** (1 tube in 371) |
-| Angle MAE — end-to-end | Reported from `final_results/` after full CV run |
+| Precision | **0.997** |
+| Recall | **1.000** |
+| F1 | **0.999** |
+| TP / FP / FN | 371 / 1 / 0 |
 
-> All metrics computed via 5-fold cross-validation on 70 images / 371 tubes.
-> Every tube appears in exactly one held-out fold.
+### Angle Estimation — Stage 2 Isolated (GT crops)
 
----
-
-## Problem
-
-**Input:** Overhead 640×480 RGB images containing 3–6 microcentrifuge tubes on varied surfaces (white, black, desk, mixed).
-
-**Output per tube:**
-- Center position `(cx, cy)` in pixels
-- Full rotation angle `θ ∈ [0°, 360°)` — the direction from hinge joint to flip tab
-
-**Coordinate system:** origin top-left, x rightward, y downward, 0° = positive x-axis, angles increase counter-clockwise.
-
----
-
-## Dataset
-
-```
-Dataset/
-├── images/          # 70 PNG images (640×480, RGB)
-└── annotations.csv  # 371 tubes with centre, bbox, and angle labels
-```
-
-| Column | Description |
+| Metric | Value |
 |---|---|
-| `image` | Filename |
-| `center_x`, `center_y` | Lid centre in pixels |
-| `bbox_x`, `bbox_y`, `bbox_w`, `bbox_h` | Axis-aligned bounding box |
-| `bbox_rotation` | Bounding box rotation (degrees, clockwise) |
-| `angle_deg` | Joint-to-tab direction `[0, 360)`, CCW from +x axis |
+| MAE | **2.5° ± 0.1°** |
+| Median | **2.0° ± 0.2°** |
+| Within 15° | **100.0% ± 0.0%** |
+| 180° flip rate | **0.0%** |
 
-Dataset available at: [Google Drive](https://drive.google.com/drive/folders/19XdosmtFivQ2mUODFSQgRPGRAqvVsDnI?usp=sharing)
+### End-to-End (YOLO crops → SAM → angle head)
+
+| Metric | Value |
+|---|---|
+| Angle MAE | **4.1°** |
+| Angle Median | **2.3°** |
+| Within 15° | **99.2%** |
+| 180° flip rate | **0.8%** |
+
+> The 1.6° gap between isolated and end-to-end MAE is entirely explained by
+> YOLO localisation imprecision: 3 extra flip errors (0.8% of 371 tubes),
+> each contributing ~180° to the mean. Non-flip MAE end-to-end is ~2.6°,
+> statistically identical to the isolated result.
 
 ---
 
-## Approach
+## Methodology
 
-### Two-Stage Pipeline
+### Pipeline
 
 ```
 Image
   │
   ▼
-┌─────────────────────────────┐
-│  Stage 1 — YOLOv11n-OBB    │  Detects tube lids as oriented bounding
-│  Detection                  │  boxes → centre (cx, cy) + box dims
-└─────────────┬───────────────┘
-              │  crop per detection
+┌──────────────────────────────┐
+│  Stage 1 — YOLOv11n-OBB     │  Detects tube lids as oriented bounding
+│  Detection                   │  boxes → centre (cx, cy) + box dims
+└─────────────┬────────────────┘
+              │
               ▼
-┌─────────────────────────────┐
-│  Stage 2 — Binned + Offset  │  128×128 crop → 36-bin classification
-│  Angle Estimation           │  + intra-bin offset → θ ∈ [0°, 360°)
-└─────────────────────────────┘
+┌──────────────────────────────┐
+│  SAM Masking                 │  Segments the tube lid; zeroes out rack
+│                              │  and background pixels before cropping
+└─────────────┬────────────────┘
+              │  128×128 masked crop per detection
+              ▼
+┌──────────────────────────────┐
+│  Stage 2 — Binned + Offset   │  36-bin classification + intra-bin
+│  Angle Estimation            │  offset regression → θ ∈ [0°, 360°)
+└──────────────────────────────┘
 ```
 
-### Stage 1 — Detection (YOLOv11n-OBB)
+### Stage 1 — YOLOv11n-OBB Detection
 
-- Model: `yolo11n-obb` pretrained on COCO, fine-tuned on the tube dataset
-- Label format: 4-corner polygon (Ultralytics OBB), normalised to [0, 1]
-- Augmentation: random flip (H/V), HSV jitter, mosaic, copy-paste
-- 5-fold CV: 56 train / 14 val images per fold, 60 epochs, patience 15
+`yolo11n-obb` pretrained on COCO, fine-tuned with 5-fold CV (56 train / 14 val images per fold, 60 epochs). Annotated as 4-corner OBB polygons normalised to [0, 1]. Augmentation: H/V flip, HSV jitter, mosaic, copy-paste.
 
-### Stage 2 — Angle Estimation (Model D — Binned + Offset)
+Oriented bounding boxes provide the detected centre coordinates and box dimensions used to prompt SAM and extract the angle head crop. The OBB axis (0–180°) is discarded — full 360° angle comes from Stage 2.
 
-**Architecture:** `MobileNetV3-small` backbone (ImageNet pretrained, `num_classes=0`) + two parallel linear heads:
+### SAM Masking
+
+Before passing a crop to the angle head, SAM (Segment Anything, ViT-Base) segments the tube lid from the full image using the YOLO box as a prompt. Non-tube pixels are replaced with neutral grey (128). This step is applied at both **train and inference time**, ensuring the angle head never sees rack geometry or background texture.
+
+Without consistent masking, Model D degraded from 2.5° isolated MAE to 23.1° end-to-end due to train/test distribution mismatch caused by rack interference. Applying masking at both stages reduced end-to-end MAE to 4.1° — an 82% reduction.
+
+### Stage 2 — Binned + Offset Angle Head (Model D)
+
+**Architecture:**
 
 ```
-crop (128×128) → MobileNetV3 features (1024-d)
-                        │
-          ┌─────────────┴──────────────┐
-          ▼                            ▼
-  cls head (1024→36)         reg head (1024→36)
-  36-bin softmax             per-bin offset [0, 1]
-          │                            │
-          └──────────┬─────────────────┘
-                     ▼
-         predicted_bin × 10° + offset × 10°  =  θ̂ ∈ [0°, 360°)
+masked crop (128×128)
+  │
+  ▼
+MobileNetV3-small (ImageNet pretrained, num_classes=0)
+  │
+  └── 1024-d feature vector
+        │
+   ┌────┴──────────────────┐
+   ▼                       ▼
+cls head                reg head
+(1024 → 36)             (1024 → 36)
+36-bin logits           per-bin offset
+   │                       │
+   └──────────┬────────────┘
+              ▼
+    bin × 10° + offset × 10° = θ̂ ∈ [0°, 360°)
 ```
 
-**Why binned outperforms direct regression:**
-Direct sin/cos regression (Model A) achieved 9.8° MAE. The binned approach (Model D) achieves 3.2° MAE — a 67% reduction. Classification provides a strong structural prior for the circular output space; the regression head only needs to fit ±5°, a much easier sub-problem.
+**Loss:** `CrossEntropy(logits, bin_idx) + MSE(offset_pred, offset_gt)`
 
-**Loss:**
-```
-L = CrossEntropy(logits, bin_idx) + MSE(offset_pred, offset_gt)
-```
+**Training:** AdamW lr=3e-4, CosineAnnealingLR, 60 epochs per fold, best checkpoint by val MAE.
 
-**Training:** AdamW, lr=3e-4, CosineAnnealingLR, 60 epochs per fold.
+**Augmentation (geometry-correct — angle label updated with each transform):**
 
-**Augmentation (geometry-correct):**
-
-| Transform | Angle update |
+| Transform | Label update |
 |---|---|
 | Horizontal flip | `(180 − θ) % 360` |
 | Vertical flip | `(360 − θ) % 360` |
 | Rotate 90° × k | `(θ + 90k) % 360` |
-| Brightness / contrast / noise | label unchanged |
+| Brightness / contrast / noise | unchanged |
 
-### What Was Tried
+**Why binned classification outperforms direct regression:**
 
-| Model | MAE | Notes |
+Representing angle as a single continuous value (even with sin/cos encoding) requires the regression head to model the full circular output space. The binned approach decomposes this: a 36-class classifier handles coarse direction (each bin covers 10°), and the regression head only needs to fit ±5° within the winning bin — a far simpler sub-problem. This decomposition produced a 74% MAE reduction over sin/cos regression (2.5° vs 9.8°).
+
+---
+
+## What Was Tried
+
+Six angle estimation approaches were benchmarked on the same 5-fold CV split before selecting Model D:
+
+| Model | MAE | Key finding |
 |---|---|---|
-| A — MobileNetV3 + sin/cos | 9.8° | Good; discontinuity handled but weaker than binned |
+| A — MobileNetV3 + sin/cos | 9.8° | Correct representation, weaker than binned |
 | B — EfficientNetV2-S + sin/cos | 16.0° | Overfits on 370 crops |
-| C — DINOv2 frozen + MLP | 68.0° | Pre-trained features encode semantics, not sub-mm geometry |
-| D — Binned + offset ✅ | **3.2°** | Best; handles circular structure via classification |
-| E — Two-stage axis + flip | 9.0° | Conceptually sound; flip classifier unstable at this data size |
-| F — TTA × 8 on D | 7.0° | TTA hurt — D's predictions already stable |
+| C — DINOv2 frozen + MLP | 68.0° | Semantic features blind to sub-mm geometry |
+| **D — Binned + offset** | **2.5°** ✅ | Best across all metrics |
+| E — Two-stage axis + flip classifier | 9.0° | Flip classifier unstable at this dataset size |
+| F — TTA × 8 on Model D | ~7.0° | Averaging hurt stable predictions |
 
-> DINOv2 failure is the most instructive result: distinguishing joint from tab requires
-> sub-millimetre local texture features that semantic pretraining does not encode.
-
----
-
-## Repository Structure
-
-```
-zeon-tubes/
-├── colab_train.ipynb        # Original per-stage training notebooks
-├── final_notebook.ipynb     # ← Single end-to-end notebook (use this)
-├── requirements.txt
-└── README.md
-```
-
-### `final_notebook.ipynb` — Cell Guide
-
-| Cell | What it does | Est. time |
-|---|---|---|
-| 1 | Installs, imports, constants, all shared utilities | 2 min |
-| 2 | Stage 1: build OBB datasets, train 5 YOLO folds, eval P/R/F1 | 60–90 min |
-| 3 | Stage 2: train 5 Model D folds on GT crops, eval angle MAE | 35–50 min |
-| 4 | End-to-end: YOLO → Model D, compute joint P/R/F1 + angle MAE | 5 min |
-| 5 | Final report: tables, error distribution, worst-case grid | 3 min |
-| 6 | Save all weights, CSVs, plots to Google Drive | 1 min |
-
-**Total: ~90–120 minutes on a T4 GPU.**
-
----
-
-## Setup
-
-### Requirements
-
-```
-torch >= 2.0
-ultralytics >= 8.3
-timm >= 0.9
-scikit-learn
-opencv-python
-pandas
-matplotlib
-```
-
-Install:
-```bash
-pip install ultralytics timm scikit-learn
-```
-
-### Google Drive Layout (expected)
-
-```
-MyDrive/zeon-tubes/
-├── Dataset/
-│   ├── images/          # 70 PNG images
-│   └── annotations.csv
-└── final_results/       # written by Cell 6
-    ├── weights/
-    │   ├── yolo_obb_fold{0-4}.pt
-    │   └── angle_fold{0-4}.pt
-    ├── e2e_predictions.csv
-    ├── per_image_difficulty.csv
-    ├── final_summary.png
-    └── worst_cases.png
-```
-
-### Running
-
-1. Open `final_notebook.ipynb` in Google Colab
-2. Runtime → Change runtime type → **T4 GPU**
-3. Run cells 1–6 in order
-
-> Images are automatically copied from Drive to local SSD before YOLO training
-> to avoid slow repeated reads over the Drive mount.
-
----
-
-## Outputs
-
-### `e2e_predictions.csv`
-
-One row per tube per image. Columns: `image`, `fold`, `outcome` (TP/FP/FN), `gt_cx`, `gt_cy`, `det_cx`, `det_cy`, `gt_angle`, `pred_angle`, `err`.
-
-### `per_image_difficulty.csv`
-
-Per-image aggregate: `image`, `n_matched`, `mae`, `max_err`, `pct15`.
-
-### `final_summary.png`
-
-Three-panel figure: end-to-end error distribution · per-fold MAE bars · cumulative accuracy at multiple thresholds.
-
-### `worst_cases.png`
-
-12-crop grid of the hardest end-to-end predictions, with GT (green) and predicted (red) direction arrows overlaid.
+The DINOv2 result is the most instructive failure: distinguishing the joint from the tab requires recognising a 2–3 pixel asymmetric texture feature. DINOv2 was trained to be invariant to exactly this kind of local variation. Rich semantic pretraining is not universally better — domain specificity matters more than model scale here.
 
 ---
 
 ## Error Analysis
 
-### Failure Modes
+**Stage 2 in isolation** achieves 100.0% within 15° across all five folds with zero flips. Every angle estimation error on a well-cropped, well-masked lid is below 15°, and fold-to-fold variance is negligible (±0.1° MAE).
 
-**1. Rack interference (dominant failure)**
-Tubes seated inside black rack holes. The rack's circular geometry competes with the lid's hinge/tab asymmetry. Model D anchors to the rack boundary rather than the lid texture.
+**End-to-end** introduces 3 additional flip errors from imprecise YOLO crops shifting the SAM mask slightly. These 3 tubes account for the entire 1.6° gap between isolated and end-to-end MAE. The remaining 368 tubes have a non-flip MAE of ~2.6°.
 
-**2. Near-boundary crops**
-Tubes close to image edges produce partially reflected crops. The BORDER_REFLECT padding introduces artificial symmetry that confuses the orientation head.
+**The impact of SAM masking:**
 
-**3. 180° flips (rare: 0.3%)**
-Physically ambiguous cases where both ends of the tube look identical — usually because the hinge or tab is occluded by the rack or an adjacent tube.
+| Setup | MAE | Within 15° | Flips |
+|---|---|---|---|
+| Stage 2, GT crops, no masking | 3.2° | 99.5% | 0.3% |
+| Stage 2, GT crops, with masking | 2.5° | 100.0% | 0.0% |
+| End-to-end, no masking | 23.1° | 85.4% | 8.6% |
+| **End-to-end, with masking** | **4.1°** | **99.2%** | **0.8%** |
 
-### What the Worst Cases Reveal
+Masking improved both isolated and end-to-end performance. The dramatic end-to-end improvement (23.1° → 4.1°) confirms that rack interference — not model capacity or data scarcity — was the dominant failure mode.
 
-Of the 12 worst predictions (all from the end-to-end run), only 1 is a true 180° flip. The remaining 11 are 17–48° errors concentrated on tubes inside the black tube rack — confirming that rack interference, not model capacity or data size, is the primary remaining failure mode.
+---
+
+## Notebook
+
+`final_notebook.ipynb` runs the full pipeline end-to-end in Google Colab.
+
+| Cell | Content | Time (T4) |
+|---|---|---|
+| 1 | Installs, constants, shared utilities | 2 min |
+| 1b | SAM model loading + masking helper | 1 min |
+| 1c | Precompute SAM-masked crops for all 371 annotations | 5–10 min |
+| 2 | Train 5 YOLOv11n-OBB folds, evaluate detection P/R/F1 | 30–50 min |
+| 3 | Train 5 Model D folds on masked crops, evaluate angle MAE | 15–30 min |
+| 4 | End-to-end: YOLO → SAM → Model D, joint metrics | 5 min |
+| 5 | Final report: tables, error distribution, worst-case grid | 3 min |
+| 6 | Save weights, CSVs, and plots to Google Drive | 1 min |
+
+**Runtime → T4 GPU. Total: ~60–100 minutes.**
+
+### Setup
+
+```bash
+pip install ultralytics timm scikit-learn transformers
+```
+
+Place the dataset at `MyDrive/zeon-tubes/Dataset/` containing `images/` and `annotations.csv`. All outputs are written to `MyDrive/zeon-tubes/final_results/`.
+
+### Dataset
+
+70 overhead RGB images (640×480), 3–6 tubes per image, across white, black, desk, and mixed surfaces. 371 total tube annotations with centre coordinates and full 360° joint-to-tab angle.
+
+Available at: [Google Drive](https://drive.google.com/drive/folders/19XdosmtFivQ2mUODFSQgRPGRAqvVsDnI?usp=sharing)
 
 ---
 
 ## Next Steps
 
-**1. Keypoint annotation — highest expected impact**
-Re-annotate the 371 tubes with explicit joint `(jx, jy)` and tab `(tx, ty)` pixel coordinates. Train YOLOv11-Pose with a 2-keypoint head. The joint→tab vector gives exact 360° angle directly — no disambiguation step needed. Architecturally eliminates the flip problem.
+**1. Keypoint annotation** — Re-annotate the 371 tubes with explicit joint `(jx, jy)` and tab `(tx, ty)` coordinates. YOLOv11-Pose with a 2-keypoint head gives the joint→tab vector directly, architecturally eliminating the 180° flip problem without a disambiguation step.
 
-**2. Rack-aware augmentation**
-Synthetically composite tube crops over rack-hole textures during training. Forces Model D to ignore the rack boundary and attend to the lid's own asymmetric features.
+**2. Rack-aware augmentation** — Composite tube crops over rack-hole textures during training, forcing the angle head to ignore rack boundaries. Targets the dominant remaining failure mode without additional annotation effort.
 
-**3. 3D rendering for data augmentation**
-Model the tube geometry once in Blender. Render at any exact angle under randomised lighting conditions, composited onto real background crops from the dataset. Provides perfect ground truth at scale and is far more tractable than conditional generative models for this domain.
+**3. 3D rendering** — Model the tube geometry once in Blender, render at any exact angle under randomised lighting and backgrounds. Provides perfect ground truth at scale — far more tractable than generative models for this domain.
 
-**4. Confidence-based abstention**
-Use the softmax entropy of Model D's classification head as a proxy for prediction uncertainty. Flag high-entropy predictions as "uncertain" rather than returning a potentially wrong angle — safer in real robot pick-and-place contexts than a confident wrong answer.
+**4. Equivariant backbone** — Replace MobileNetV3 with an E(2)-steerable CNN. Rotation equivariance is guaranteed by construction rather than learned through augmentation, improving data efficiency — relevant given only 371 training crops.
 
 ---
 
 ## AI Usage
 
-Claude (Anthropic) was used to:
-- Design the two-stage pipeline architecture and evaluate all detection and angle estimation options
-- Generate Colab-ready training and evaluation code across Stage 1, Stage 2, and the final end-to-end notebook
-- Debug runtime errors (shape mismatches, label format issues, memory management)
-- Structure the 5-fold cross-validation framework
-
-All written analysis, interpretation of results, architectural decisions, and next-steps reasoning are the author's own.
+Claude (Anthropic) was used to design the pipeline architecture, generate and debug training code, and structure the cross-validation framework. All analysis, result interpretation, and architectural decisions are the author's own.
 
 ---
 
